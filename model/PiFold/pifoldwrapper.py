@@ -43,7 +43,7 @@ class PiFoldWrapper():
         self.model = self.model.to(self.device)
         self.model.load_state_dict(torch.load(state_dict))
         
-    def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all):
+    def forward_batch(self,X,S,mask):
         with torch.no_grad():
             X = X.to(self.device)
             S = S.to(self.device)
@@ -60,6 +60,26 @@ class PiFoldWrapper():
             log_probs_full[mask.reshape(B*L).bool(),:] = log_probs
             log_probs_full = log_probs_full.reshape(B,L,21)
             return log_probs_full
+    
+    def forward(self,X, S, mask, chain_M, residue_idx, chain_encoding_all):
+        with torch.no_grad():
+            log_probs_list = []
+            for i, x_i in enumerate(X):
+                mask_i = mask[i].unsqueeze(0)
+                L = mask_i.shape[1]
+                x_i = x_i.unsqueeze(0)[mask_i.unsqueeze(-1).unsqueeze(-1).expand(1,L,4,3).bool()] # mask is [1,L]extract to [1,,L*mask]
+                x_i = x_i.view(1,-1,4,3) #[1,L_mask,4,3]
+
+                s_i = S[i].unsqueeze(0)[mask_i.bool()]
+                s_i = s_i.view(1,-1) #[1,L_mask,4,3]
+                
+                log_probs_i = self.forward_batch(x_i,s_i,torch.ones_like(s_i))
+                log_probs_full_i = torch.zeros(1,L,21).to(self.device)
+                log_probs_full_i[mask_i.unsqueeze(-1).expand(1,L,21).bool()] = log_probs_i.view(-1)
+                log_probs_list.append(log_probs_full_i)
+            log_probs = torch.cat(log_probs_list,dim=0)
+            log_probs = torch.nn.functional.log_softmax(log_probs,dim=-1)
+            return log_probs
         
     def logits(self, X, S, mask, chain_M, residue_idx, chain_encoding_all):
         with torch.no_grad():
@@ -72,17 +92,29 @@ class PiFoldWrapper():
     def sample(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, temperature=1.0):
         with torch.no_grad():
             B,L = X.shape[:2]
-            score = None
-            logits = self.logits(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+            logits_list = []
+            for i, x_i in enumerate(X):
+                mask_i = mask[i].unsqueeze(0)
+                L = mask_i.shape[1]
+                x_i = x_i.unsqueeze(0)[mask_i.unsqueeze(-1).unsqueeze(-1).expand(1,L,4,3).bool()] # mask is [1,L]extract to [1,,L*mask]
+                x_i = x_i.view(1,-1,4,3)
+                s_i = S[i].unsqueeze(0)
+                s_i = s_i[mask_i.bool()]
+                s_i = s_i.view(1,-1) #[1,L_mask,4,3]
+                score = None
+                
+                x_i, s_i, score, h_V, h_E, E_idx, batch_id, mask_bw, mask_fw, decoding_order = self.model._get_features(s_i, score, X=x_i, mask=torch.ones_like(s_i))
+                _, logits_i = self.model(h_V, h_E, E_idx, batch_id,return_logit=True)
+                logits_full_i = torch.zeros(1,L,logits_i.shape[-1]).to(self.device)
+                logits_full_i[mask_i.unsqueeze(-1).expand(1,L,logits_i.shape[-1]).bool()] = logits_i.view(-1)
+                logits_list.append(logits_full_i)
+            logits = torch.cat(logits_list,dim=0)
             logits = logits / temperature
             probs = torch.nn.functional.softmax(logits,dim=-1)
             probs[torch.isnan(probs)] = 1e-6
             probs_flat = probs.view(-1,probs.shape[-1])
-
-            sampled_seq = torch.multinomial(probs_flat[:,:20],num_samples=1,replacement=True).squeeze(-1)
-            sampled_seq_full = torch.full((B * L,), 20, dtype=torch.long, device=sampled_seq.device)
-            sampled_seq_full[mask.view(-1).bool()] = sampled_seq
-            sampled_seq = sampled_seq_full.view(B,L)
+            sampled_seq = torch.multinomial(probs_flat,num_samples=1,replacement=True).squeeze(-1)
+            sampled_seq = sampled_seq.view(B,L)
         return sampled_seq
     
     def score(self,X, S, S_test,mask, chain_M, residue_idx, chain_encoding_all):
